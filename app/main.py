@@ -1,25 +1,21 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 import calendar
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Literal
 from decimal import Decimal, ROUND_HALF_UP
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
-from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -32,6 +28,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 async def lifespan(app: FastAPI):
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index("date")
     db.attendance_logs.create_index("emp_code")
     yield
@@ -40,8 +37,54 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Helpers & Conversions
 # --------------------------------------------------------------------------- #
+def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    if isinstance(dt, (int, float)):
+        return int(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+def to_api_employee(doc: dict) -> dict:
+    d = dict(doc)
+    d.pop("_id", None)
+    if "created_at" in d and d["created_at"] is not None:
+        d["created_at"] = dt_to_epoch_ms(d["created_at"])
+    return d
+
+def to_api_attendance(doc: dict) -> dict:
+    d = dict(doc)
+    d.pop("_id", None)
+    d.pop("id", None)
+    if "punch_in" in d:
+        d["punch_in"] = dt_to_epoch_ms(d["punch_in"])
+    if "punch_out" in d:
+        d["punch_out"] = dt_to_epoch_ms(d["punch_out"])
+    if "history" in d and isinstance(d["history"], list):
+        api_history = []
+        for h in d["history"]:
+            h_item = dict(h)
+            if "at" in h_item:
+                h_item["at"] = dt_to_epoch_ms(h_item["at"])
+            if "changes" in h_item and isinstance(h_item["changes"], dict):
+                c_item = {}
+                for k, v in h_item["changes"].items():
+                    if isinstance(v, dict):
+                        field_change = dict(v)
+                        if k in ("punch_in", "punch_out"):
+                            field_change["from"] = dt_to_epoch_ms(field_change.get("from"))
+                            field_change["to"] = dt_to_epoch_ms(field_change.get("to"))
+                        c_item[k] = field_change
+                    else:
+                        c_item[k] = v
+                h_item["changes"] = c_item
+            api_history.append(h_item)
+        d["history"] = api_history
+    return d
+
 def get_month_bounds(month_str: str):
     y, m = map(int, month_str.split("-"))
     start_dt = datetime(y, m, 1)
@@ -73,6 +116,7 @@ def r8_round(value, decimals=2):
     if value is None:
         return None
     return float(Decimal(str(value)).quantize(Decimal("1." + "0"*decimals), rounding=ROUND_HALF_UP))
+
 def get_shift_times(date_str: str, shift_start: str, shift_end: str):
     h_start, m_start = map(int, shift_start.split(":"))
     h_end, m_end = map(int, shift_end.split(":"))
@@ -105,36 +149,36 @@ def compute_overtime(punch_out: datetime, shift_end_dt: datetime) -> int:
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(..., min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field("18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: str
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 class PunchOutIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
 
 
 class RegularizeIn(BaseModel):
-    status: Optional[str] = None
-    punch_in: Optional[int] = None
-    punch_out: Optional[int] = None
-    reason: str
-    regularized_by: str
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
@@ -147,24 +191,31 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
+    if body.shift_start == body.shift_end:
+        raise HTTPException(422, "shift_start must differ from shift_end")
+
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc)
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
-    doc.pop("_id", None)
-    return doc
+    return to_api_employee(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None, 
+    page: int = Query(1, ge=1), 
+    page_size: int = Query(20, ge=1, le=100)
+):
     q = {}
     if department:
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size))
+    raw_items = list(db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size))
+    items = [to_api_employee(x) for x in raw_items]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -174,7 +225,12 @@ def punch_in(body: PunchInIn):
     if not emp:
         raise HTTPException(404, "Employee not found")
 
-    ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc) if body.punched_at else datetime.now(timezone.utc)
+    if body.punched_at is not None:
+        ms = (body.punched_at // 1000) * 1000
+        ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+
     ts_ist = ts.astimezone(IST)
     
     shift_start = emp["shift_start"]
@@ -183,7 +239,7 @@ def punch_in(body: PunchInIn):
     current_date = ts_ist.date()
     if shift_end <= shift_start:
         h_end, m_end = map(int, shift_end.split(":"))
-        if ts_ist.time() <= datetime.min.replace(hour=h_end, minute=m_end).time():
+        if ts_ist.time() < datetime.min.replace(hour=h_end, minute=m_end).time():
             current_date -= timedelta(days=1)
             
     d = current_date.isoformat()
@@ -202,13 +258,11 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
     try:
-        res = db.attendance_logs.insert_one(doc)
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
         
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    return to_api_attendance(doc)
 
 
 @app.get("/attendance")
@@ -217,9 +271,12 @@ def list_attendance(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be greater than date_to")
+
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -234,10 +291,8 @@ def list_attendance(
         
     skip = (page - 1) * page_size
     total = db.attendance_logs.count_documents(q)
-    page_docs = list(db.attendance_logs.find(q).sort("date", -1).skip(skip).limit(page_size))
-    
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
+    raw_docs = list(db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size))
+    page_docs = [to_api_attendance(x) for x in raw_docs]
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
 
@@ -247,7 +302,11 @@ def punch_out(body: PunchOutIn):
     if not emp:
         raise HTTPException(404, "Employee not found")
 
-    ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc) if body.punched_at else datetime.now(timezone.utc)
+    if body.punched_at is not None:
+        ms = (body.punched_at // 1000) * 1000
+        ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
     
     q = {
         "emp_code": body.emp_code,
@@ -289,8 +348,7 @@ def punch_out(body: PunchOutIn):
     if not res:
         raise HTTPException(409, "Already punched out")
         
-    res["id"] = str(res.pop("_id"))
-    return res
+    return to_api_attendance(res)
 
 
 @app.patch("/attendance/{emp_code}/{date}")
@@ -308,11 +366,13 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     
     new_in = record.get("punch_in")
     if body.punch_in is not None:
-        new_in = datetime.fromtimestamp(body.punch_in / 1000, tz=timezone.utc)
+        ms_in = (body.punch_in // 1000) * 1000
+        new_in = datetime.fromtimestamp(ms_in / 1000, tz=timezone.utc)
         
     new_out = record.get("punch_out")
     if body.punch_out is not None:
-        new_out = datetime.fromtimestamp(body.punch_out / 1000, tz=timezone.utc)
+        ms_out = (body.punch_out // 1000) * 1000
+        new_out = datetime.fromtimestamp(ms_out / 1000, tz=timezone.utc)
 
     if new_status in ["ABSENT", "LEAVE"]:
         if body.punch_in is not None or body.punch_out is not None:
@@ -329,7 +389,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         current_date = ts_ist.date()
         if shift_end <= shift_start:
             h_end, m_end = map(int, shift_end.split(":"))
-            if ts_ist.time() <= datetime.min.replace(hour=h_end, minute=m_end).time():
+            if ts_ist.time() < datetime.min.replace(hour=h_end, minute=m_end).time():
                 current_date -= timedelta(days=1)
         
         if current_date.isoformat() != date:
@@ -348,20 +408,17 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         
     if new_in != record.get("punch_in"):
         changes["punch_in"] = {
-            "from": int(record["punch_in"].timestamp()*1000) if record.get("punch_in") else None,
-            "to": int(new_in.timestamp()*1000) if new_in else None
+            "from": record.get("punch_in"),
+            "to": new_in
         }
         to_update["punch_in"] = new_in
         
     if new_out != record.get("punch_out"):
         changes["punch_out"] = {
-            "from": int(record["punch_out"].timestamp()*1000) if record.get("punch_out") else None,
-            "to": int(new_out.timestamp()*1000) if new_out else None
+            "from": record.get("punch_out"),
+            "to": new_out
         }
         to_update["punch_out"] = new_out
-
-    if not changes:
-        raise HTTPException(422, "No changes supplied")
 
     start_dt, end_dt = get_shift_times(date, emp["shift_start"], emp["shift_end"])
     
@@ -394,8 +451,11 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         changes["half_day"] = {"from": record.get("half_day", False), "to": new_half_day}
         to_update["half_day"] = new_half_day
 
+    if not changes:
+        raise HTTPException(422, "No changes supplied")
+
     history_entry = {
-        "at": datetime.now(timezone.utc),
+        "at": datetime.now(timezone.utc).replace(microsecond=0),
         "by": body.regularized_by,
         "reason": body.reason,
         "changes": changes
@@ -416,8 +476,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     if not res:
         raise HTTPException(409, "Concurrent edit detected")
         
-    res["id"] = str(res.pop("_id"))
-    return res
+    return to_api_attendance(res)
 
 
 # --------------------------------------------------------------------------- #
@@ -742,11 +801,12 @@ def get_department_trend_pipeline(department: str, date_from: str, date_to: str)
         }}
     ]
 
+
 # --------------------------------------------------------------------------- #
 # Analytics Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/analytics/employees/{emp_code}/monthly")
-def get_employee_monthly(emp_code: str, month: str):
+def get_employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, "Employee not found")
@@ -780,7 +840,10 @@ def get_employee_monthly(emp_code: str, month: str):
     }
 
 @app.get("/analytics/departments/summary")
-def get_department_summary(month: str, department: Optional[str] = None):
+def get_department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"), 
+    department: Optional[str] = None
+):
     pipeline = get_department_summary_pipeline(month, department)
     docs = list(db.employees.aggregate(pipeline))
     for d in docs:
@@ -788,13 +851,21 @@ def get_department_summary(month: str, department: Optional[str] = None):
     return {"month": month, "items": docs}
 
 @app.get("/analytics/leaderboard/late")
-def get_late_leaderboard(month: str, department: Optional[str] = None, limit: int = 10):
+def get_late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"), 
+    department: Optional[str] = None, 
+    limit: int = Query(10, ge=1, le=50)
+):
     pipeline = get_late_leaderboard_pipeline(month, department, limit)
     docs = list(db.employees.aggregate(pipeline))
     return {"month": month, "items": docs}
 
 @app.get("/analytics/departments/{department}/trend")
-def get_department_trend(department: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to")):
+def get_department_trend(
+    department: str, 
+    date_from: str = Query(..., alias="from"), 
+    date_to: str = Query(..., alias="to")
+):
     if date_to < date_from:
         raise HTTPException(422, "date_to < date_from")
     
@@ -847,7 +918,7 @@ def explain_endpoint(
         explain_plan = db.command("explain", {
             "find": "attendance_logs",
             "filter": q,
-            "sort": {"date": -1},
+            "sort": [("date", -1), ("emp_code", 1)],
             "skip": skip,
             "limit": page_size
         }, verbosity="executionStats")
